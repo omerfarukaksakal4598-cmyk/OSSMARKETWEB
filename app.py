@@ -5,18 +5,24 @@ import uuid
 import os
 import re
 import hashlib
+import hmac
+import secrets
 from pathlib import Path
 from datetime import datetime
 
-# ---------------- CONFIG ----------------
+# ==================================================
+# OSS MARKET CONFIG
+# ==================================================
 
-ROOT = Path(__file__).parent
+ROOT = Path(__file__).resolve().parent
 DATA = ROOT / "data"
 IMAGES = DATA / "images"
 UPLOADS = DATA / "uploads"
-DB = DATA / "catalog.json"
 
-for folder in [DATA, IMAGES, UPLOADS]:
+DB = DATA / "catalog.json"
+ADMIN_DB = DATA / "admin.json"
+
+for folder in (DATA, IMAGES, UPLOADS):
     folder.mkdir(parents=True, exist_ok=True)
 
 if not DB.exists():
@@ -28,46 +34,16 @@ st.set_page_config(
     layout="wide"
 )
 
-# ---------------- DESIGN ----------------
+DEFAULT_PASSWORD = "OSS-Admin-2026"
 
-st.markdown("""
-<style>
-.stApp {
-    background: #0b1120;
-    color: #f1f5f9;
-}
-section[data-testid="stSidebar"] {
-    background: #111827;
-}
-.hero {
-    padding: 30px;
-    border-radius: 18px;
-    background: linear-gradient(120deg,#172554,#312e81);
-    margin-bottom: 25px;
-}
-.hero h1 {
-    color: white;
-    font-size: 42px;
-    margin: 0;
-}
-.hero p {
-    color: #cbd5e1;
-    font-size: 16px;
-}
-.app-card {
-    background: #172033;
-    border: 1px solid #29364b;
-    border-radius: 15px;
-    padding: 15px;
-}
-</style>
-""", unsafe_allow_html=True)
-
-# ---------------- DATABASE ----------------
+# ==================================================
+# DATABASE
+# ==================================================
 
 def load_apps():
     try:
-        return json.loads(DB.read_text(encoding="utf-8"))
+        result = json.loads(DB.read_text(encoding="utf-8"))
+        return result if isinstance(result, list) else []
     except Exception:
         return []
 
@@ -79,57 +55,135 @@ def save_apps(apps):
     )
     temp.replace(DB)
 
+def load_admin():
+    if not ADMIN_DB.exists():
+        return None
+
+    try:
+        return json.loads(ADMIN_DB.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+def save_admin(data):
+    temp = ADMIN_DB.with_suffix(".tmp")
+    temp.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2),
+        encoding="utf-8"
+    )
+    temp.replace(ADMIN_DB)
+
+def password_hash(password, salt):
+    return hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode("utf-8"),
+        bytes.fromhex(salt),
+        310000
+    ).hex()
+
+def verify_password(password, admin):
+    if not admin:
+        return False
+
+    calculated = password_hash(
+        password,
+        admin["salt"]
+    )
+
+    return hmac.compare_digest(
+        calculated,
+        admin["hash"]
+    )
+
+def set_password(password):
+    salt = secrets.token_hex(16)
+
+    save_admin({
+        "salt": salt,
+        "hash": password_hash(password, salt),
+        "changed": True
+    })
+
+# ==================================================
+# FILE FUNCTIONS
+# ==================================================
+
 def safe_filename(name):
     name = Path(name).name
     name = re.sub(r"[^a-zA-Z0-9._-]", "_", name)
     return name[:100] or "download.bin"
 
-def save_file(upload, folder, app_id):
+def save_upload(upload, folder, app_id):
     if upload is None:
         return ""
 
-    ext = Path(upload.name).suffix.lower()
-    filename = app_id + ext
-    path = folder / filename
-    path.write_bytes(upload.getbuffer())
+    extension = Path(upload.name).suffix.lower()
+    filename = app_id + extension
+
+    target = folder / filename
+    target.write_bytes(upload.getbuffer())
+
     return filename
 
 def remove_file(folder, filename):
     if not filename:
         return
 
-    path = folder / Path(filename).name
+    target = folder / Path(filename).name
 
-    if path.exists():
-        path.unlink()
+    if target.exists():
+        target.unlink()
 
-# ---------------- ADMIN ----------------
-
-def admin_password():
-    return os.environ.get(
-        "OSS_MARKET_PASSWORD",
-        "OSS-Admin-2026"
-    )
+# ==================================================
+# ADMIN AUTHENTICATION
+# ==================================================
 
 def admin_login():
-    st.sidebar.title("Yönetici")
+    st.sidebar.title("Yönetici Paneli")
 
+    admin = load_admin()
+
+    # İlk kurulum
+    if admin is None:
+        st.sidebar.info("İlk yönetici kurulumu")
+
+        with st.sidebar.form("first_login"):
+            password = st.text_input(
+                "İlk giriş şifresi",
+                type="password"
+            )
+
+            submit = st.form_submit_button(
+                "Giriş yap",
+                use_container_width=True
+            )
+
+        if submit:
+            if password == DEFAULT_PASSWORD:
+                st.session_state["admin"] = True
+                st.session_state["must_change_password"] = True
+                st.rerun()
+            else:
+                st.sidebar.error("İlk giriş şifresi yanlış.")
+
+        return
+
+    # Normal giriş
     if not st.session_state.get("admin", False):
-
         with st.sidebar.form("login"):
             password = st.text_input(
                 "Yönetici şifresi",
                 type="password"
             )
 
-            login = st.form_submit_button(
+            submit = st.form_submit_button(
                 "Giriş yap",
                 use_container_width=True
             )
 
-        if login:
-            if hashlib.sha256(password.encode()).digest() == hashlib.sha256(admin_password().encode()).digest():
-                st.session_state.admin = True
+        if submit:
+            if verify_password(password, admin):
+                st.session_state["admin"] = True
+                st.session_state["must_change_password"] = False
                 st.rerun()
             else:
                 st.sidebar.error("Şifre yanlış.")
@@ -137,25 +191,114 @@ def admin_login():
     else:
         st.sidebar.success("Yönetici girişi açık")
 
-        if st.sidebar.button("Çıkış yap"):
-            st.session_state.admin = False
+        if st.sidebar.button("Oturumu kapat"):
+            st.session_state["admin"] = False
+            st.session_state["must_change_password"] = False
             st.rerun()
 
-# ---------------- HEADER ----------------
+# ==================================================
+# PASSWORD CHANGE
+# ==================================================
+
+def password_change_screen():
+    st.title("🔐 Yönetici şifresi belirle")
+
+    st.warning(
+        "Güvenlik nedeniyle yönetim panelini kullanmadan önce "
+        "varsayılan şifreni değiştirmelisin."
+    )
+
+    with st.form("mandatory_password_change"):
+        new_password = st.text_input(
+            "Yeni şifre",
+            type="password"
+        )
+
+        repeat_password = st.text_input(
+            "Yeni şifreyi tekrar gir",
+            type="password"
+        )
+
+        submit = st.form_submit_button(
+            "Şifremi kaydet",
+            use_container_width=True
+        )
+
+        if submit:
+            if len(new_password) < 10:
+                st.error("Şifre en az 10 karakter olmalı.")
+
+            elif new_password != repeat_password:
+                st.error("Şifreler eşleşmiyor.")
+
+            elif new_password == DEFAULT_PASSWORD:
+                st.error("Varsayılan şifreyi kullanamazsın.")
+
+            else:
+                set_password(new_password)
+
+                st.session_state["must_change_password"] = False
+                st.success("Yeni şifren kaydedildi.")
+                st.rerun()
+
+# ==================================================
+# DESIGN
+# ==================================================
+
+st.markdown("""
+<style>
+.stApp {
+    background: #0b1120;
+    color: #f1f5f9;
+}
+section[data-testid="stSidebar"] {
+    background: #111827;
+}
+.hero {
+    padding: 32px;
+    border-radius: 20px;
+    background: linear-gradient(120deg,#172554,#312e81);
+    margin-bottom: 25px;
+    border: 1px solid #334155;
+}
+.hero h1 {
+    color: white;
+    font-size: 42px;
+    margin: 0;
+}
+.hero p {
+    color: #cbd5e1;
+}
+</style>
+""", unsafe_allow_html=True)
+
+# ==================================================
+# HEADER
+# ==================================================
 
 st.markdown("""
 <div class="hero">
     <h1>OSS MARKET</h1>
-    <p>OSS uygulamalarının kişisel mağazası.</p>
-    <p>Uygulamalarını keşfet, incele ve indir.</p>
+    <p>Kendi uygulama mağazan.</p>
+    <p>OSS uygulamalarını keşfet, tanıt ve indir.</p>
 </div>
 """, unsafe_allow_html=True)
 
 admin_login()
 
+# Zorunlu şifre değişikliği
+if (
+    st.session_state.get("admin", False)
+    and st.session_state.get("must_change_password", False)
+):
+    password_change_screen()
+    st.stop()
+
 apps = load_apps()
 
-# ---------------- TABS ----------------
+# ==================================================
+# TABS
+# ==================================================
 
 market_tab, manage_tab = st.tabs([
     "🛒 Uygulama Mağazası",
@@ -168,20 +311,21 @@ market_tab, manage_tab = st.tabs([
 
 with market_tab:
 
-    search_col, category_col = st.columns([3, 1])
+    col1, col2 = st.columns([3, 1])
 
-    with search_col:
+    with col1:
         search = st.text_input(
-            "🔎 Uygulama ara",
-            placeholder="Örn: OSS Browser"
+            "Uygulama ara",
+            placeholder="OSS Browser..."
         )
 
-    with category_col:
-        categories = ["Tümü"] + sorted(
-            set(a.get("category", "Diğer") for a in apps)
-        )
+    with col2:
+        categories = ["Tümü"] + sorted({
+            app.get("category", "Diğer")
+            for app in apps
+        })
 
-        category = st.selectbox(
+        selected_category = st.selectbox(
             "Kategori",
             categories
         )
@@ -189,21 +333,24 @@ with market_tab:
     filtered = []
 
     for app in apps:
-
-        text = (
+        searchable = (
             app.get("name", "") + " " +
+            app.get("short", "") + " " +
             app.get("description", "")
         ).lower()
 
-        if search.lower() not in text:
+        if search.lower() not in searchable:
             continue
 
-        if category != "Tümü" and app.get("category") != category:
+        if (
+            selected_category != "Tümü"
+            and app.get("category") != selected_category
+        ):
             continue
 
         filtered.append(app)
 
-    st.caption(f"{len(filtered)} uygulama bulundu.")
+    st.caption(f"{len(filtered)} uygulama")
 
     if not filtered:
         st.info("Henüz uygulama eklenmemiş.")
@@ -212,25 +359,36 @@ with market_tab:
 
         with st.container(border=True):
 
-            col1, col2 = st.columns([1, 2.5])
+            image_path = IMAGES / app.get("image", "")
 
-            with col1:
-                image_path = IMAGES / app.get("image", "")
+            if app.get("image") and image_path.is_file():
+                left, right = st.columns([1, 2.5])
+            else:
+                left, right = st.columns([1, 2.5])
 
-                if image_path.is_file():
-                    st.image(str(image_path), use_container_width=True)
+            with left:
+                if app.get("image") and image_path.is_file():
+                    st.image(
+                        str(image_path),
+                        use_container_width=True
+                    )
                 else:
                     st.markdown("## 📦")
 
-            with col2:
-
-                st.subheader(app["name"])
+            with right:
+                st.subheader(app.get("name", "İsimsiz uygulama"))
 
                 st.caption(
-                    f'{app["category"]}  ·  Sürüm {app["version"]}'
+                    f'{app.get("category", "Diğer")} · '
+                    f'v{app.get("version", "1.0")}'
                 )
 
-                st.write(app["description"])
+                if app.get("short"):
+                    st.write(app["short"])
+
+                if app.get("description"):
+                    with st.expander("Uygulama açıklaması"):
+                        st.write(app["description"])
 
                 if app.get("website"):
                     st.link_button(
@@ -241,7 +399,6 @@ with market_tab:
                 file_path = UPLOADS / app.get("file", "")
 
                 if file_path.is_file():
-
                     st.download_button(
                         "⬇️ Uygulamayı indir",
                         data=file_path.read_bytes(),
@@ -260,227 +417,305 @@ with market_tab:
 with manage_tab:
 
     if not st.session_state.get("admin", False):
-
         st.warning(
-            "Uygulama eklemek için yönetici girişi yapmalısın."
+            "Yönetim panelini kullanmak için giriş yapmalısın."
         )
 
     else:
 
-        st.subheader("＋ Yeni uygulama ekle")
+        st.title("Yönetim Merkezi")
 
-        with st.form("new_app", clear_on_submit=True):
+        add_tab, edit_tab, security_tab = st.tabs([
+            "＋ Uygulama ekle",
+            "📦 Uygulamaları yönet",
+            "🔐 Güvenlik"
+        ])
 
-            name = st.text_input("Uygulama adı")
+        # ------------------------------------------
+        # ADD APPLICATION
+        # ------------------------------------------
 
-            c1, c2 = st.columns(2)
+        with add_tab:
 
-            with c1:
-                category = st.selectbox(
-                    "Kategori",
-                    [
-                        "Tarayıcı",
-                        "Araçlar",
-                        "Üretkenlik",
-                        "Multimedya",
-                        "Oyun",
-                        "Geliştirici araçları",
-                        "Diğer"
-                    ]
-                )
+            with st.form("new_app", clear_on_submit=True):
 
-                version = st.text_input(
-                    "Sürüm",
-                    value="1.0"
-                )
+                name = st.text_input("Uygulama adı *")
 
-            with c2:
-                short = st.text_input("Kısa tanıtım")
-                website = st.text_input(
-                    "Proje bağlantısı (isteğe bağlı)"
-                )
+                col1, col2 = st.columns(2)
 
-            description = st.text_area(
-                "Uygulama açıklaması",
-                height=150
-            )
-
-            image = st.file_uploader(
-                "Kapak görseli",
-                type=["png", "jpg", "jpeg", "webp"]
-            )
-
-            file = st.file_uploader(
-                "İndirilebilir uygulama dosyası",
-                help="EXE, ZIP, APK veya başka dosya türleri."
-            )
-
-            submit = st.form_submit_button(
-                "🚀 Mağazaya ekle",
-                use_container_width=True
-            )
-
-            if submit:
-
-                if not name.strip() or not description.strip() or file is None:
-
-                    st.error(
-                        "Uygulama adı, açıklama ve dosya zorunludur."
+                with col1:
+                    category = st.selectbox(
+                        "Kategori",
+                        [
+                            "Tarayıcı",
+                            "Araçlar",
+                            "Üretkenlik",
+                            "Multimedya",
+                            "Oyun",
+                            "Geliştirici araçları",
+                            "Diğer"
+                        ]
                     )
 
-                else:
-
-                    app_id = uuid.uuid4().hex
-
-                    filename = save_file(
-                        file,
-                        UPLOADS,
-                        app_id
-                    )
-
-                    image_name = save_file(
-                        image,
-                        IMAGES,
-                        app_id
-                    ) if image else ""
-
-                    new_app = {
-                        "id": app_id,
-                        "name": name.strip(),
-                        "short": short.strip(),
-                        "category": category,
-                        "version": version.strip() or "1.0",
-                        "website": website.strip(),
-                        "description": description.strip(),
-                        "file": filename,
-                        "original_filename": safe_filename(file.name),
-                        "image": image_name,
-                        "date": datetime.now().strftime(
-                            "%d.%m.%Y %H:%M"
-                        )
-                    }
-
-                    apps.append(new_app)
-                    save_apps(apps)
-
-                    st.success("Uygulama eklendi!")
-                    st.rerun()
-
-        # ---------------- EDIT / DELETE ----------------
-
-        st.divider()
-        st.subheader("Mevcut uygulamalar")
-
-        if not apps:
-            st.info("Henüz uygulama yok.")
-
-        for app in apps:
-
-            with st.expander(
-                f'{app["name"]} — v{app["version"]}'
-            ):
-
-                with st.form("edit_" + app["id"]):
-
-                    new_name = st.text_input(
-                        "Uygulama adı",
-                        value=app["name"]
-                    )
-
-                    new_version = st.text_input(
+                    version = st.text_input(
                         "Sürüm",
-                        value=app["version"]
+                        value="1.0"
                     )
 
-                    new_description = st.text_area(
-                        "Açıklama",
-                        value=app["description"]
+                with col2:
+                    short = st.text_input(
+                        "Kısa tanıtım (isteğe bağlı)"
                     )
 
-                    new_website = st.text_input(
-                        "Proje bağlantısı",
-                        value=app.get("website", "")
+                    website = st.text_input(
+                        "Proje bağlantısı (isteğe bağlı)"
                     )
 
-                    new_image = st.file_uploader(
-                        "Yeni görsel",
-                        type=["png", "jpg", "jpeg", "webp"],
-                        key="img_" + app["id"]
+                description = st.text_area(
+                    "Uygulama açıklaması (isteğe bağlı)",
+                    height=140
+                )
+
+                image = st.file_uploader(
+                    "Kapak görseli (isteğe bağlı)",
+                    type=["png", "jpg", "jpeg", "webp"]
+                )
+
+                upload = st.file_uploader(
+                    "Uygulama dosyası *",
+                    help="EXE, ZIP, APK ve diğer dosyalar."
+                )
+
+                submit = st.form_submit_button(
+                    "🚀 Mağazaya ekle",
+                    use_container_width=True
+                )
+
+                if submit:
+
+                    if not name.strip():
+                        st.error("Uygulama adı zorunludur.")
+
+                    elif upload is None:
+                        st.error("Uygulama dosyası zorunludur.")
+
+                    else:
+                        app_id = uuid.uuid4().hex
+
+                        filename = save_upload(
+                            upload,
+                            UPLOADS,
+                            app_id
+                        )
+
+                        image_name = save_upload(
+                            image,
+                            IMAGES,
+                            app_id
+                        ) if image else ""
+
+                        new_app = {
+                            "id": app_id,
+                            "name": name.strip(),
+                            "short": short.strip(),
+                            "category": category,
+                            "version": version.strip() or "1.0",
+                            "website": website.strip(),
+                            "description": description.strip(),
+                            "file": filename,
+                            "original_filename": safe_filename(upload.name),
+                            "image": image_name,
+                            "date": datetime.now().strftime(
+                                "%d.%m.%Y %H:%M"
+                            )
+                        }
+
+                        apps.append(new_app)
+                        save_apps(apps)
+
+                        st.success("Uygulama mağazaya eklendi.")
+                        st.rerun()
+
+        # ------------------------------------------
+        # EDIT / DELETE
+        # ------------------------------------------
+
+        with edit_tab:
+
+            if not apps:
+                st.info("Henüz uygulama yok.")
+
+            for app in apps:
+
+                with st.expander(
+                    f'{app["name"]} · v{app["version"]}'
+                ):
+
+                    with st.form("edit_" + app["id"]):
+
+                        new_name = st.text_input(
+                            "Uygulama adı",
+                            value=app.get("name", "")
+                        )
+
+                        new_version = st.text_input(
+                            "Sürüm",
+                            value=app.get("version", "1.0")
+                        )
+
+                        new_short = st.text_input(
+                            "Kısa tanıtım",
+                            value=app.get("short", "")
+                        )
+
+                        new_description = st.text_area(
+                            "Açıklama",
+                            value=app.get("description", "")
+                        )
+
+                        new_website = st.text_input(
+                            "Proje bağlantısı",
+                            value=app.get("website", "")
+                        )
+
+                        new_image = st.file_uploader(
+                            "Yeni görsel (isteğe bağlı)",
+                            type=["png", "jpg", "jpeg", "webp"],
+                            key="image_" + app["id"]
+                        )
+
+                        new_file = st.file_uploader(
+                            "Yeni uygulama dosyası (isteğe bağlı)",
+                            key="file_" + app["id"]
+                        )
+
+                        save_edit = st.form_submit_button(
+                            "Değişiklikleri kaydet"
+                        )
+
+                        if save_edit:
+
+                            current = load_apps()
+
+                            target = next(
+                                (
+                                    x for x in current
+                                    if x["id"] == app["id"]
+                                ),
+                                None
+                            )
+
+                            if target:
+                                target.update({
+                                    "name": new_name.strip(),
+                                    "version": new_version.strip(),
+                                    "short": new_short.strip(),
+                                    "description": new_description.strip(),
+                                    "website": new_website.strip()
+                                })
+
+                                if new_image:
+                                    remove_file(IMAGES, target.get("image", ""))
+                                    target["image"] = save_upload(
+                                        new_image,
+                                        IMAGES,
+                                        app["id"]
+                                    )
+
+                                if new_file:
+                                    remove_file(UPLOADS, target.get("file", ""))
+                                    target["file"] = save_upload(
+                                        new_file,
+                                        UPLOADS,
+                                        app["id"]
+                                    )
+                                    target["original_filename"] = safe_filename(
+                                        new_file.name
+                                    )
+
+                                save_apps(current)
+                                st.success("Uygulama güncellendi.")
+                                st.rerun()
+
+                    confirm = st.checkbox(
+                        "Silme işlemini onaylıyorum",
+                        key="confirm_" + app["id"]
                     )
 
-                    new_file = st.file_uploader(
-                        "Yeni uygulama dosyası",
-                        key="file_" + app["id"]
-                    )
-
-                    save_edit = st.form_submit_button(
-                        "Değişiklikleri kaydet"
-                    )
-
-                    if save_edit:
-
+                    if st.button(
+                        "🗑️ Uygulamayı sil",
+                        key="delete_" + app["id"],
+                        disabled=not confirm
+                    ):
                         current = load_apps()
 
                         target = next(
-                            (x for x in current if x["id"] == app["id"]),
+                            (
+                                x for x in current
+                                if x["id"] == app["id"]
+                            ),
                             None
                         )
 
                         if target:
+                            remove_file(UPLOADS, target.get("file", ""))
+                            remove_file(IMAGES, target.get("image", ""))
 
-                            target["name"] = new_name.strip()
-                            target["version"] = new_version.strip()
-                            target["description"] = new_description.strip()
-                            target["website"] = new_website.strip()
-
-                            if new_image:
-                                remove_file(IMAGES, target["image"])
-                                target["image"] = save_file(
-                                    new_image,
-                                    IMAGES,
-                                    app["id"]
-                                )
-
-                            if new_file:
-                                remove_file(UPLOADS, target["file"])
-                                target["file"] = save_file(
-                                    new_file,
-                                    UPLOADS,
-                                    app["id"]
-                                )
-                                target["original_filename"] = safe_filename(
-                                    new_file.name
-                                )
+                            current = [
+                                x for x in current
+                                if x["id"] != app["id"]
+                            ]
 
                             save_apps(current)
-                            st.success("Güncellendi.")
-                            st.rerun()
 
-                confirm = st.checkbox(
-                    "Silmek istediğimi onaylıyorum",
-                    key="confirm_" + app["id"]
+                        st.success("Uygulama silindi.")
+                        st.rerun()
+
+        # ------------------------------------------
+        # SECURITY
+        # ------------------------------------------
+
+        with security_tab:
+
+            st.subheader("Yönetici şifresini değiştir")
+
+            with st.form("change_password"):
+
+                old_password = st.text_input(
+                    "Mevcut şifre",
+                    type="password"
                 )
 
-                if st.button(
-                    "🗑️ Uygulamayı sil",
-                    key="delete_" + app["id"],
-                    disabled=not confirm
-                ):
+                new_password = st.text_input(
+                    "Yeni şifre",
+                    type="password"
+                )
 
-                    remove_file(UPLOADS, app["file"])
-                    remove_file(IMAGES, app["image"])
+                repeat_password = st.text_input(
+                    "Yeni şifre tekrar",
+                    type="password"
+                )
 
-                    current = [
-                        x for x in load_apps()
-                        if x["id"] != app["id"]
-                    ]
+                change = st.form_submit_button(
+                    "Şifreyi değiştir"
+                )
 
-                    save_apps(current)
-                    st.success("Uygulama silindi.")
-                    st.rerun()
+                if change:
+
+                    admin = load_admin()
+
+                    if not verify_password(old_password, admin):
+                        st.error("Mevcut şifre yanlış.")
+
+                    elif len(new_password) < 10:
+                        st.error("Yeni şifre en az 10 karakter olmalı.")
+
+                    elif new_password != repeat_password:
+                        st.error("Yeni şifreler eşleşmiyor.")
+
+                    else:
+                        set_password(new_password)
+                        st.success("Yönetici şifren değiştirildi.")
 
         st.divider()
-
-        st.caption(
-            f"Toplam {len(apps)} uygulama kayıtlı."
-        )
+        st.caption(f"Mağazada {len(apps)} uygulama bulunuyor.")
